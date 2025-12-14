@@ -98,7 +98,7 @@
 
     <script>
         const ADMIN_KEY_STORAGE = 'admin_long_term_key';
-        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        const ws = new WebSocket(`wss://${window.location.host}/ws`);
         const messagesDiv = document.getElementById('messages');
         const input = document.getElementById('message-input');
         const sendButton = document.getElementById('send-button');
