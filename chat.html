@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>lan chat</title>
+    <style>
+        /* --- 基础布局和响应式设计 --- */
+        body { font-family: sans-serif; margin: 0; background-color: #f4f4f9; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+        .container { max-width: 900px; margin: 0 auto; background-color: #fff; box-shadow: 0 4px 8px rgba(0,0,0,0.1); display: flex; flex-grow: 1; }
+        
+        /* 侧边栏和主聊天区布局 */
+        #sidebar { width: 250px; border-right: 1px solid #eee; padding: 15px; flex-shrink: 0; display: flex; flex-direction: column; }
+        #chat-area { flex-grow: 1; padding: 15px; display: flex; flex-direction: column; }
+        #messages { border: 1px solid #ddd; height: 350px; overflow-y: scroll; padding: 10px; margin-bottom: 15px; background-color: #e9ebee; border-radius: 4px; flex-grow: 1; }
+        #input-area { display: flex; flex-shrink: 0; padding-top: 10px; }
+        #message-input { flex-grow: 1; padding: 10px; border: 1px solid #ccc; border-radius: 4px 0 0 4px; font-size: 1em; }
+        #send-button { padding: 10px 15px; background-color: #28a745; color: white; border: none; border-radius: 0 4px 4px 0; cursor: pointer; font-size: 1em; }
+        #send-button:disabled { background-color: #90c79f; cursor: not-allowed; }
+
+        /* 移动端适配 */
+        @media (max-width: 768px) {
+            .container { flex-direction: column; width: 100%; height: 100%; }
+            #sidebar { width: 100%; height: 100px; border-right: none; border-bottom: 1px solid #eee; padding: 10px; flex-direction: row; justify-content: space-between; align-items: center; }
+            #chat-area { padding: 10px; }
+            #session-list-wrapper { display: none; }
+            #role-display { font-size: 1.2em; }
+            h1 { font-size: 1.5em; }
+        }
+
+        /* --- 消息样式和时间戳 --- */
+        .message-row { margin-bottom: 10px; display: flex; flex-direction: column; }
+        .message-mine { align-items: flex-end; }
+        .message-other { align-items: flex-start; }
+
+        .message-bubble { 
+            padding: 8px 12px; 
+            border-radius: 15px; 
+            max-width: 70%; 
+            display: inline-block; 
+            word-wrap: break-word; 
+        }
+        
+        .message-mine .message-bubble { 
+            background-color: #007bff; 
+            color: white; 
+            border-radius: 15px 15px 0 15px;
+        }
+        .message-other .message-bubble { 
+            background-color: #6c757d; 
+            color: white; 
+            border-radius: 15px 15px 15px 0; 
+        }
+
+        .message-time { 
+            font-size: 0.7em; 
+            color: #999; 
+            margin-top: 2px;
+            padding: 0 5px; 
+        }
+        .message-mine .message-time { text-align: right; }
+        .message-other .message-time { text-align: left; }
+        .system-note { color: #ff9800; font-style: italic; text-align: center; margin: 10px 0; font-size: 0.9em; }
+
+        .session-item { padding: 10px; margin-bottom: 5px; background-color: #f8f9fa; border: 1px solid #eee; cursor: pointer; border-radius: 4px; }
+        .session-item.active { background-color: #cfe2ff; font-weight: bold; border-color: #007bff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="sidebar">
+            <h3 id="role-display">连接中...</h3>
+            <p id="admin-key-status" style="font-size: 0.8em; color: red;">Admin Key: Unset</p>
+            <div id="session-list-wrapper">
+                <hr>
+                <h4>会话列表 (Admin Only)</h4>
+                <div id="session-list">
+                    <p style="color: #6c757d;">用户列表为空</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="chat-area">
+            <h1>Bun 端到端加密聊天</h1>
+            <div id="messages"></div>
+
+            <div id="input-area">
+                <input type="text" id="message-input" placeholder="输入消息..." disabled>
+                <button id="send-button" disabled>发送</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const ADMIN_KEY_STORAGE = 'admin_long_term_key';
+        const ws = new WebSocket(`ws://${window.location.host}/ws`);
+        const messagesDiv = document.getElementById('messages');
+        const input = document.getElementById('message-input');
+        const sendButton = document.getElementById('send-button');
+        const roleDisplay = document.getElementById('role-display');
+        const sessionList = document.getElementById('session-list');
+        const adminKeyStatus = document.getElementById('admin-key-status');
+
+        let localRole = 'unknown';
+        let activeSessionId = null; 
+        const sessionStore = new Map(); // { userId: { key: CryptoKey, history: [], privateKey: CryptoKey } }
+
+        // --- 通用辅助函数 ---
+
+        // 格式化时间戳
+        function formatTime(timestamp) {
+            const date = new Date(timestamp);
+            return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+        
+        // 显示消息
+        function appendMessage(text, className, timestamp = Date.now()) {
+            const row = document.createElement('div');
+            row.className = `message-row ${className}`;
+
+            if (className === 'system-note') {
+                row.textContent = text;
+            } else {
+                const bubble = document.createElement('span');
+                bubble.className = 'message-bubble';
+                bubble.textContent = text;
+
+                const time = document.createElement('span');
+                time.className = 'message-time';
+                time.textContent = formatTime(timestamp);
+
+                row.appendChild(bubble);
+                row.appendChild(time);
+            }
+
+            messagesDiv.appendChild(row);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+
+        // --- E2EE Web Crypto 核心函数 ---
+
+        // 导入/导出密钥的 helper
+        async function exportCryptoKey(key) { return await crypto.subtle.exportKey("jwk", key); }
+        async function importCryptoKey(jwk, usages) { 
+            return await crypto.subtle.importKey(
+                "jwk", 
+                jwk, 
+                { name: "ECDH", namedCurve: "P-256" }, 
+                true, 
+                usages
+            ); 
+        }
+
+        // 1. 生成 DH 密钥对 (P-256)
+        async function generateDHKeyPair() {
+            return await crypto.subtle.generateKey(
+                { name: "ECDH", namedCurve: "P-256" },
+                true,
+                ["deriveKey"]
+            );
+        }
+
+        // 2. 导出公钥 (用于发送)
+        async function exportPublicKey(key) {
+            return await crypto.subtle.exportKey("jwk", key);
+        }
+
+        // 3. 导入公钥 (用于接收)
+        async function importPublicKey(jwk) {
+            return await crypto.subtle.importKey(
+                "jwk",
+                jwk,
+                { name: "ECDH", namedCurve: "P-256" },
+                false,
+                []
+            );
+        }
+
+        // 4. 派生共享密钥 (AES-GCM 256位)
+        async function deriveSharedSecret(privateKey, publicKey) {
+            const sharedSecret = await crypto.subtle.deriveKey(
+                { name: "ECDH", public: publicKey },
+                privateKey,
+                { name: "AES-GCM", length: 256 },
+                true,
+                ["encrypt", "decrypt"]
+            );
+            return sharedSecret;
+        }
+
+        // 5. 加密消息
+        async function encryptMessage(text, sharedKey) {
+            const encoder = new TextEncoder();
+            const data = encoder.encode(text);
+            const iv = crypto.getRandomValues(new Uint8Array(12)); 
+            
+            const ciphertext = await crypto.subtle.encrypt(
+                { name: "AES-GCM", iv: iv },
+                sharedKey,
+                data
+            );
+
+            return {
+                cipher: Array.from(new Uint8Array(ciphertext)),
+                iv: Array.from(iv)
+            };
+        }
+
+        // 6. 解密消息
+        async function decryptMessage(encryptedData, sharedKey) {
+            const iv = new Uint8Array(encryptedData.iv);
+            const cipher = new Uint8Array(encryptedData.cipher);
+
+            try {
+                const plaintext = await crypto.subtle.decrypt(
+                    { name: "AES-GCM", iv: iv },
+                    sharedKey,
+                    cipher
+                );
+                const decoder = new TextDecoder();
+                return decoder.decode(plaintext);
+            } catch (e) {
+                console.error("解密失败 (OperationError):", e);
+                return "[解密失败或密文被篡改]";
+            }
+        }
+
+        // --- 会话和 UI 管理 ---
+
+        function switchSession(userId) {
+            if (activeSessionId === userId) return;
+
+            if (activeSessionId) {
+                const oldItem = document.getElementById(`session-${activeSessionId}`);
+                if (oldItem) oldItem.classList.remove('active');
+            }
+
+            activeSessionId = userId;
+            const session = sessionStore.get(userId);
+
+            const newItem = document.getElementById(`session-${userId}`);
+            if (newItem) newItem.classList.add('active');
+
+            // 更新聊天区
+            messagesDiv.innerHTML = '';
+            session.history.forEach(msg => appendMessage(msg.text, msg.className, msg.timestamp));
+            
+            if (session.key) {
+                appendMessage(`切换到会话 ID ${userId}。密钥已就绪。`, 'system-note');
+                sendButton.disabled = false;
+                input.disabled = false;
+            } else {
+                appendMessage(`切换到会话 ID ${userId}。正在等待密钥交换...`, 'system-note');
+                sendButton.disabled = true;
+                input.disabled = true;
+            }
+        }
+        
+        function renderSessionList() {
+            if (localRole !== 'admin') return;
+            sessionList.innerHTML = '';
+            if (sessionStore.size === 0) {
+                 sessionList.innerHTML = '<p style="color: #6c757d;">用户列表为空</p>';
+                 return;
+            }
+
+            sessionStore.forEach((session, userId) => {
+                const div = document.createElement('div');
+                div.id = `session-${userId}`;
+                div.className = 'session-item';
+                div.textContent = `用户 ID: ${userId} (${session.key ? '已加密' : '未就绪'})`;
+                div.onclick = () => switchSession(userId);
+                sessionList.appendChild(div);
+            });
+            
+            if (activeSessionId) {
+                 const item = document.getElementById(`session-${activeSessionId}`);
+                 if (item) item.classList.add('active');
+            }
+        }
+
+        // --- 密钥持久化和交换逻辑 ---
+        
+        async function loadOrCreateAdminKey() {
+            let keyPair;
+            const storedKey = localStorage.getItem(ADMIN_KEY_STORAGE);
+            
+            if (storedKey) {
+                try {
+                    const jwk = JSON.parse(storedKey);
+                    // 导入私钥必须有 deriveKey 权限
+                    const privKey = await importCryptoKey(jwk.priv, ["deriveKey"]);
+                    // 导入公钥无需权限
+                    const pubKey = await importCryptoKey(jwk.pub, []); 
+
+                    keyPair = { publicKey: pubKey, privateKey: privKey };
+                    adminKeyStatus.textContent = "Admin Key: Loaded (Persistent)";
+                    adminKeyStatus.style.color = 'green';
+                    
+                } catch (e) {
+                    console.error("Failed to load stored key:", e);
+                    localStorage.removeItem(ADMIN_KEY_STORAGE);
+                    adminKeyStatus.textContent = "Admin Key: FAILED to load. Regenerating.";
+                    adminKeyStatus.style.color = 'red';
+                    return loadOrCreateAdminKey(); 
+                }
+            } else {
+                // 生成新密钥
+                keyPair = await generateDHKeyPair();
+                const jwk = {
+                    pub: await exportCryptoKey(keyPair.publicKey),
+                    priv: await exportCryptoKey(keyPair.privateKey)
+                };
+                localStorage.setItem(ADMIN_KEY_STORAGE, JSON.stringify(jwk));
+                adminKeyStatus.textContent = "Admin Key: New Key Generated & Saved";
+                adminKeyStatus.style.color = 'blue';
+            }
+            
+            // 发送公钥给服务器进行存储
+            const pubJwk = await exportCryptoKey(keyPair.publicKey);
+            ws.send(JSON.stringify({ type: 'SET_ADMIN_KEY', key: pubJwk }));
+
+            return keyPair.privateKey;
+        }
+
+        async function initUserE2EE(event) {
+            const keyPair = await generateDHKeyPair();
+            const userPublicKey = await exportPublicKey(keyPair.publicKey);
+            
+            activeSessionId = event.data.wsId || 'user_local'; // 用户使用一个本地ID
+            sessionStore.set(activeSessionId, { key: null, history: [], privateKey: keyPair.privateKey });
+            
+            ws.send(JSON.stringify({ type: 'REQUEST_ADMIN_KEY' }));
+            ws.send(JSON.stringify({ type: 'PUBLIC_KEY', key: userPublicKey }));
+        }
+
+        // --- WebSocket 事件处理 ---
+        ws.onopen = async () => {
+            appendMessage("已连接到服务器。等待角色分配...", 'system-note');
+        };
+
+        ws.onmessage = async (event) => {
+            const data = JSON.parse(event.data);
+            const senderId = data.senderId || 'System';
+
+            if (data.type === 'STATUS') {
+                if (data.role) {
+                    localRole = data.role;
+                    roleDisplay.textContent = `当前角色: ${localRole === 'admin' ? '管理员' : '访问用户'}`;
+                    
+                    if (localRole === 'admin') {
+                        await loadOrCreateAdminKey();
+                    } else if (localRole === 'user') {
+                        await initUserE2EE(event);
+                    }
+                }
+                if (data.message) { appendMessage(`[系统] ${data.message}`, 'system-note'); }
+                
+            } else if (data.type === 'NEW_USER' && localRole === 'admin') {
+                sessionStore.set(data.userId, { key: null, history: [], privateKey: null });
+                renderSessionList();
+                appendMessage(data.message, 'system-note');
+                if (!activeSessionId) switchSession(data.userId);
+
+            } else if (data.type === 'USER_LEFT' && localRole === 'admin') {
+                sessionStore.delete(data.userId);
+                renderSessionList();
+                if (activeSessionId === data.userId) {
+                    activeSessionId = null;
+                    messagesDiv.innerHTML = '<p class="system-note">当前会话已结束。</p>';
+                }
+                
+            } else if (data.type === 'ADMIN_KEY_RESPONSE' && localRole === 'user') {
+                const adminLongTermPublicKey = await importPublicKey(data.key);
+                const session = sessionStore.get(activeSessionId);
+                const sharedKey = await deriveSharedSecret(session.privateKey, adminLongTermPublicKey);
+                
+                session.key = sharedKey; 
+                sendButton.disabled = false;
+                input.disabled = false;
+                appendMessage("密钥交换完成。您现在可以安全地发送消息。", 'system-note');
+
+            } else if (data.type === 'PUBLIC_KEY') {
+                const isUser = localRole === 'admin';
+                const currentId = isUser ? senderId : activeSessionId;
+                
+                if (isUser) {
+                    // 管理员收到用户公钥
+                    const adminPrivateKey = await loadOrCreateAdminKey(); 
+                    const userPublicKey = await importPublicKey(data.key);
+                    const sharedKey = await deriveSharedSecret(adminPrivateKey, userPublicKey);
+                    
+                    const session = sessionStore.get(currentId);
+                    session.key = sharedKey;
+                    
+                    if (activeSessionId === currentId) {
+                         appendMessage(`用户 ID ${currentId} 的密钥已就绪。`, 'system-note');
+                         sendButton.disabled = false;
+                         input.disabled = false;
+                    }
+                    renderSessionList();
+                }
+
+            } else if (data.type === 'MESSAGE' && sessionStore.get(activeSessionId) && sessionStore.get(activeSessionId).key) {
+                const session = sessionStore.get(activeSessionId);
+                const receivedTimestamp = data.timestamp || Date.now(); 
+                
+                const plaintext = await decryptMessage(data.encrypted, session.key);
+                
+                const className = localRole === 'admin' ? 'message-other' : 'message-other';
+
+                // 保存消息历史
+                session.history.push({ 
+                    text: plaintext, 
+                    className: className, 
+                    timestamp: receivedTimestamp 
+                });
+
+                // 仅在当前会话窗口显示
+                if (activeSessionId === (localRole === 'admin' ? senderId : activeSessionId)) {
+                    appendMessage(plaintext, className, receivedTimestamp);
+                }
+            } else if (data.type === 'ERROR') {
+                appendMessage(`错误: ${data.message}`, 'system-note');
+                sendButton.disabled = true;
+                input.disabled = true;
+            }
+        };
+
+        ws.onclose = () => {
+            appendMessage("连接断开，无法通信。", 'system-note');
+            sendButton.disabled = true;
+            input.disabled = true;
+        };
+
+        // --- 发送消息处理 ---
+        sendButton.onclick = async () => {
+            const text = input.value.trim();
+            const session = sessionStore.get(activeSessionId);
+            if (!text || !session || !session.key) return;
+
+            const sendTime = Date.now(); // 记录发送时间
+
+            // 1. 加密
+            const encryptedData = await encryptMessage(text, session.key);
+            
+            // 2. 发送密文，并附加时间戳
+            ws.send(JSON.stringify({
+                type: 'MESSAGE',
+                encrypted: encryptedData,
+                targetId: localRole === 'admin' ? activeSessionId : null,
+                timestamp: sendTime 
+            }));
+
+            // 3. 保存并显示自己的消息
+            const className = 'message-mine';
+            session.history.push({ text: text, className: className, timestamp: sendTime });
+            appendMessage(text, className, sendTime);
+            input.value = '';
+        };
+
+        input.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter' && !sendButton.disabled) {
+                sendButton.click();
+            }
+        });
+    </script>
+</body>
+</html>
